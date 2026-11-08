@@ -8,14 +8,17 @@ except ImportError:
     from playwright.sync_api import sync_playwright
 
 # --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 建议填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 建议填写
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
+COOKIE_VALUE  = os.environ.get('COOKIE_VALUE') or ""   # remember_web cookie 值，可选
+DISCORD_TOKEN = (os.environ.get('DISCORD_TOKEN') or "").strip()  # Discord 用户 Token
+EMAIL         = os.environ.get('EMAIL') or ""          # 登录邮箱,可选，作为备用
+PASSWORD      = os.environ.get('PASSWORD') or ""       # 登录密码,可选，作为备用
+TG_CHAT_ID    = os.environ.get('TG_CHAT_ID') or ""     # Telegram Chat ID,可选，通知
+TG_BOT_TOKEN  = os.environ.get('TG_BOT_TOKEN') or ""   # Telegram Bot Token,可选
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
+DISCORD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
 # --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
 IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
@@ -419,7 +422,105 @@ def solve_turnstile(page, timeout=120, success_check=None,
         pass
     return False
 
+def discord_oauth_login():
+    """用 Discord Token 完成 HidenCloud OAuth，返回已登录的 requests.Session"""
+    if not DISCORD_TOKEN:
+        return None
+
+    s = requests.Session()
+    if REQUESTS_PROXIES:
+        s.proxies.update(REQUESTS_PROXIES)
+    s.headers.update({
+        'User-Agent': DISCORD_UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+
+    try:
+        # 1) 让 HidenCloud 生成带 state 的 Discord 授权地址，同时拿到会话 cookie
+        r = s.get(f"{BASE_URL}/oauth/discord/login", allow_redirects=False, timeout=30)
+        oauth_url = r.headers.get('location') or ''
+        if 'discord.com' not in oauth_url:
+            log(f"❌ Discord OAuth 初始化失败: HTTP {r.status_code}")
+            return None
+        log("🎮 已获取 HidenCloud Discord 授权地址")
+
+        # 2) 用 Discord Token 自动同意授权
+        r2 = s.post(
+            oauth_url,
+            headers={
+                'Authorization': DISCORD_TOKEN,
+                'Content-Type': 'application/json',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/',
+            },
+            json={'authorize': True},
+            timeout=30,
+        )
+        try:
+            data = r2.json()
+        except Exception:
+            data = {}
+        callback = data.get('location') or ''
+        if 'code=' not in callback:
+            log(f"❌ Discord 授权失败: HTTP {r2.status_code} {str(data)[:200]}")
+            return None
+        log("🎮 Discord 授权成功，正在回跳 HidenCloud...")
+
+        # 3) 回跳 HidenCloud 完成登录
+        r3 = s.get(callback, allow_redirects=True, timeout=30)
+        if 'auth/login' in (r3.url or ''):
+            log(f"❌ Discord 回跳后仍未登录: {r3.url}")
+            return None
+
+        names = [c.name for c in s.cookies
+                 if 'hidencloud' in (c.domain or '') or not c.domain]
+        log(f"🎮 Discord 登录成功，cookies: {names}")
+        return s
+    except Exception as e:
+        log(f"❌ Discord Token 登录异常: {e}")
+        return None
+
+
 def login(page):
+    # 0. Discord Token 登录（免费服务续期必须走 Discord）
+    if DISCORD_TOKEN:
+        log("🎮 尝试 Discord Token 登录...")
+        sess = discord_oauth_login()
+        if sess is not None:
+            cookies = []
+            for c in sess.cookies:
+                domain = c.domain or 'dash.hidencloud.com'
+                if 'hidencloud' not in domain:
+                    continue
+                cookies.append({
+                    'name': c.name,
+                    'value': c.value,
+                    'domain': domain,
+                    'path': c.path or '/',
+                    'secure': True,
+                    'sameSite': 'Lax',
+                })
+            if cookies:
+                try:
+                    page.context.add_cookies(cookies)
+                    log(f"🍪 已写入 {len(cookies)} 个 Discord 登录 Cookie")
+                except Exception as e:
+                    log(f"⚠️ 写入 Discord 登录 Cookie 失败: {e}")
+                try:
+                    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+                    solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8)
+                    page_title = page.title()
+                    log(f"📝 当前Title: {page_title}")
+                    if "auth/login" not in page.url:
+                        log("✅ Discord Token 登录成功！当前已到达dashboard页面")
+                        return True
+                    log("⚠️ Discord 登录会话无效，切换到其他登录方式...")
+                except Exception as e:
+                    log(f"⚠️ Discord 登录后访问失败: {e}")
+        else:
+            log("⚠️ Discord Token 登录失败，切换到其他登录方式...")
+
     # 1. Cookie 登录尝试
     if COOKIE_VALUE:
         log("📇 尝试 Cookie 登录...")
@@ -578,7 +679,7 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page, _retry=0):
+def renew_service(page):
 
     try:
         log("➡ 进入续期流程...")
@@ -659,87 +760,14 @@ def renew_service(page, _retry=0):
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url and page_ready(page):
+            if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
-
-            # Create Invoice 有时会在新标签页打开发票
-            for p in page.context.pages:
-                if p is not page and "/payment/invoice/" in (p.url or '') and page_ready(p):
-                    page = p
-                    new_invoice_url = p.url
-                    log(f"🎉 新标签页已打开: {new_invoice_url}")
-                    break
-            if new_invoice_url:
-                break
-
-            # 弹窗内 Turnstile 通过后 iframe 不会消失，不能据此判断拦截；
-            # 只有整页 Cloudflare 安全验证页才需要处理。
-            if not page_ready(page):
-                log("⚠️ 遇到整页拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, success_check=page_ready, reload_after=8)
-            else:
-                st = turnstile_state(page)
-                if st["total"] > 0 and st["solved"] < st["total"]:
-                    log("🛡️ 页面 Turnstile 尚未通过，先处理...")
-                    solve_turnstile(page, timeout=60, require_positive=True,
-                                    shot_on_timeout="modal_turnstile_fail.png")
-                    # 只有表单还没提交、按钮仍可见时才重新点击
-                    try:
-                        if create_btn.first.is_visible():
-                            create_btn.click(timeout=8000)
-                            log("🔄 Turnstile 已通过，重新点击 'Create Invoice'...")
-                    except Exception:
-                        pass
+            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                log("⚠️ 遇到拦截，尝试处理...")
+                solve_turnstile(page, timeout=45, reload_after=8)
             time.sleep(1)
-
-        # 兜底：创建发票后可能被 CF / 登录页 / 其他跳转打断，
-        # 直接去该服务的未付账单列表里找刚生成的发票。
-        if not new_invoice_url:
-            if "/auth/login" in page.url:
-                log("🔐 续期过程中被重定向到登录页，重新登录...")
-                try:
-                    login(page)
-                except Exception as e:
-                    log(f"⚠️ 重新登录异常: {e}")
-            try:
-                m = re.search(r'/service/(\d+)/manage', SERVICE_URL)
-                if m:
-                    invoices_url = f"{BASE_URL}/service/{m.group(1)}/invoices?where=unpaid"
-                    log(f"➡️ 打开未付账单列表: {invoices_url}")
-                    page.goto(invoices_url, wait_until="domcontentloaded", timeout=60000)
-                    solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-                    links = re.findall(
-                        r'''href=["']([^"']*?/payment/invoice/[^"']+)["']''', page.content())
-                    links = [l.replace('&amp;', '&') for l in links if 'download' not in l]
-                    if links:
-                        link = links[0]
-                        if link.startswith('/'):
-                            link = BASE_URL + link
-                        elif not link.startswith('http'):
-                            link = f"{BASE_URL}/{link}"
-                        new_invoice_url = link
-                        log(f"🔗 找到未付发票: {new_invoice_url}")
-                    else:
-                        log("⚠️ 未付账单列表中没有找到发票")
-            except Exception as e:
-                log(f"⚠️ 未付账单兜底失败: {e}")
-
-        # 还是没发票就重走一次续期流程（服务端会删除同一到期日的重复未付账单）
-        if not new_invoice_url and _retry < 1:
-            log("🔄 仍未获取到发票，重新执行一次续期流程...")
-            if "/auth/login" in page.url:
-                try:
-                    login(page)
-                except Exception:
-                    pass
-            try:
-                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-                solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-            except Exception:
-                pass
-            return renew_service(page, _retry + 1)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -749,40 +777,11 @@ def renew_service(page, _retry=0):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        # 发票页可能自带 Turnstile，先确认 token 再点 Pay
-        st = turnstile_state(page)
-        if st["total"] > 0 and st["solved"] < st["total"]:
-            log("🛡️ 发票页 Turnstile 尚未通过，先处理...")
-            solve_turnstile(page, timeout=60, require_positive=True,
-                            shot_on_timeout="invoice_turnstile_fail.png")
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        try:
-            pay_btn.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
-            pass
-        try:
-            pay_btn.click(timeout=15000)
-        except Exception as e:
-            # 页面的滚动容器有时会让 Playwright 判定按钮在视口外，改用 DOM 点击兜底
-            log(f"⚠️ 普通点击 Pay 失败（{str(e).splitlines()[0]}），改用 DOM 点击...")
-            clicked = False
-            try:
-                pay_btn.evaluate("el => el.click()")
-                clicked = True
-            except Exception:
-                pass
-            if not clicked:
-                clicked = page.evaluate("""() => {
-                    const els = Array.from(document.querySelectorAll('button, a, input[type=submit]'));
-                    const b = els.find(x => /pay now|pay|支付/i.test((x.innerText || x.value || '')));
-                    if (b) { b.scrollIntoView({block: 'center'}); b.click(); return true; }
-                    return false;
-                }""")
-            if not clicked:
-                raise
+        pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
         # 等待支付确认页面或跳转回服务页
@@ -799,9 +798,10 @@ def renew_service(page, _retry=0):
 
 def main():
     # 检查必要环境变量
-    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
+    log(f"🔍 凭证检测: DISCORD_TOKEN={'已配置' if DISCORD_TOKEN else '未配置'}, "
+        f"COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
         f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
+    if not DISCORD_TOKEN and not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证")
         sys.exit(1)
 
