@@ -749,11 +749,40 @@ def renew_service(page, _retry=0):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        # 发票页可能自带 Turnstile，先确认 token 再点 Pay
+        st = turnstile_state(page)
+        if st["total"] > 0 and st["solved"] < st["total"]:
+            log("🛡️ 发票页 Turnstile 尚未通过，先处理...")
+            solve_turnstile(page, timeout=60, require_positive=True,
+                            shot_on_timeout="invoice_turnstile_fail.png")
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        try:
+            pay_btn.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        try:
+            pay_btn.click(timeout=15000)
+        except Exception as e:
+            # 页面的滚动容器有时会让 Playwright 判定按钮在视口外，改用 DOM 点击兜底
+            log(f"⚠️ 普通点击 Pay 失败（{str(e).splitlines()[0]}），改用 DOM 点击...")
+            clicked = False
+            try:
+                pay_btn.evaluate("el => el.click()")
+                clicked = True
+            except Exception:
+                pass
+            if not clicked:
+                clicked = page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('button, a, input[type=submit]'));
+                    const b = els.find(x => /pay now|pay|支付/i.test((x.innerText || x.value || '')));
+                    if (b) { b.scrollIntoView({block: 'center'}); b.click(); return true; }
+                    return false;
+                }""")
+            if not clicked:
+                raise
         log("✅ 'Pay' 按钮已点击。")
 
         # 等待支付确认页面或跳转回服务页
