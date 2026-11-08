@@ -659,13 +659,25 @@ def renew_service(page):
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
+            if "/payment/invoice/" in page.url and page_ready(page):
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, reload_after=8)
+            # 弹窗内 Turnstile 通过后 iframe 不会消失，不能据此判断拦截；
+            # 只有整页 Cloudflare 安全验证页才需要处理。
+            if not page_ready(page):
+                log("⚠️ 遇到整页拦截，尝试处理...")
+                solve_turnstile(page, timeout=45, success_check=page_ready, reload_after=8)
+            else:
+                st = turnstile_state(page)
+                if st["total"] > 0 and st["solved"] < st["total"]:
+                    log("🛡️ 弹窗 Turnstile 尚未通过，先处理...")
+                    solve_turnstile(page, timeout=45, require_positive=True)
+                    try:
+                        create_btn.click(timeout=8000)
+                        log("🔄 Turnstile 已通过，重新点击 'Create Invoice'...")
+                    except Exception as e:
+                        log(f"⚠️ 重新点击 'Create Invoice' 失败: {e}")
             time.sleep(1)
 
         if not new_invoice_url:
